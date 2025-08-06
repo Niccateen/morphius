@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""
+Whisper Video-to-Subtitle Converter - The Chad Edition
+Recursively processes videos in nested folders cuz ain't nobody got time for clicking
+Optimized for potato PCs without GPUs on Pop!_OS (Linux)
+"""
+
+import os
+import sys
+import json
+import subprocess
+import threading
+import queue
+import shutil
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import tempfile
+import time
+from datetime import timedelta, datetime
+
+# Config file cuz we're not savages
+CONFIG_PATH = Path.home() / ".whisper_subtitle_config.json"
+
+class DependencyChecker:
+    """Checks if you got the goods installed, installs em if you don't"""
+    
+    @staticmethod
+    def check_command(command):
+        """Check if a command exists (basically 'which' but in Python)"""
+        return shutil.which(command) is not None
+    
+    @staticmethod
+    def check_python_package(package_name):
+        """Check if a Python package is installed (try importing it)"""
+        try:
+            __import__(package_name.replace("-", "_"))
+            return True
+        except ImportError:
+            return False
+    
+    @staticmethod
+    def install_system_package(package_name):
+        """Yeet system packages into existence using apt"""
+        try:
+            subprocess.run(
+                ["pkexec", "apt-get", "install", "-y", package_name],
+                check=True,
+                capture_output=True
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    @staticmethod
+    def install_python_package(package_name):
+        """pip install go brrrr"""
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", package_name],
+                check=True,
+                capture_output=True
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    @classmethod
+    def check_and_install_dependencies(cls):
+        """Make sure we got all the sauce we need"""
+        missing_deps = []
+        
+        # Check if ffmpeg is vibing
+        if not cls.check_command("ffmpeg"):
+            print("FFmpeg not found. Attempting to install...")
+            if not cls.install_system_package("ffmpeg"):
+                missing_deps.append("ffmpeg (system package)")
+        
+        # Python packages we need to make this bad boy run
+        required_packages = [
+            "faster-whisper",  # The speedy boi
+            "av",  # PyAV for audio shenanigans
+            "numpy"  # Math stuff
+        ]
+        
+        for package in required_packages:
+            if not cls.check_python_package(package):
+                print(f"Installing {package}...")
+                if not cls.install_python_package(package):
+                    missing_deps.append(f"{package} (Python package)")
+        
+        if missing_deps:
+            error_msg = "Failed to install dependencies:\n" + "\n".join(missing_deps)
+            error_msg += "\n\nPlease install manually:\n"
+            error_msg += "System: sudo apt install ffmpeg\n"
+            error_msg += "Python: pip install faster-whisper av numpy"
+            messagebox.showerror("Dependency Error", error_msg)
+            return False
+        
+        return True
+
+
+class SubtitleGenerator:
+    """The actual Whisper magic happens here fr fr"""
+    
+    def __init__(self, model_size="tiny", device="cpu", compute_type="int8"):
+        """Fire up the Whisper model (might take a sec)"""
+        from faster_whisper import WhisperModel
+        
+        self.model_size = model_size
+        self.device = device
+        self.compute_type = compute_type
+        
+        # CPU optimization - we're not trying to melt your potato
+        num_workers = min(4, os.cpu_count() or 1)  # Cap at 4 threads cuz we're not greedy
+        
+        self.model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,  # int8 cuz we're memory conscious kings
+            cpu_threads=num_workers,
+            num_workers=num_workers
+        )
+    
+    def extract_audio(self, video_path, audio_path):
+        """Rip the audio from video like extracting the soul"""
+        try:
+            # Low bitrate settings cuz we're not audiophiles here
+            cmd = [
+                "ffmpeg", "-i", str(video_path),
+                "-vn",  # No video, audio only gang
+                "-ar", "16000",  # 16kHz - Whisper's favorite flavor
+                "-ac", "1",  # Mono cuz stereo is overrated for transcription
+                "-c:a", "pcm_s16le",  # WAV format, keeping it simple
+                "-y",  # Overwrite without asking, we're confident
+                str(audio_path)
+            ]
+            
+            subprocess.run(cmd, check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg said nah: {e.stderr.decode() if e.stderr else 'Unknown error'}")
+            return False
+    
+    def get_audio_duration(self, audio_path):
+        """Get how long this audio is so we can estimate stuff"""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return float(result.stdout.strip())
+        except:
+            return None
+    
+    def transcribe_audio(self, audio_path, translate_to_english=False, progress_callback=None):
+        """Where the magic happens - audio goes in, text comes out (in English if you want)"""
+        try:
+            # Set task based on whether we want translation
+            task = "translate" if translate_to_english else "transcribe"
+            
+            # Optimized settings for potato CPUs
+            segments, info = self.model.transcribe(
+                str(audio_path),
+                task=task,  # "transcribe" keeps original language, "translate" converts to English
+                beam_size=1,  # Smaller beam = faster zoom zoom
+                best_of=1,  # Just one candidate, we're not picky
+                temperature=0,  # No randomness, we want consistency
+                word_timestamps=False,  # Nah, too expensive for our CPU
+                vad_filter=True,  # Skip the quiet parts, smart move
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    speech_pad_ms=200
+                )
+            )
+            
+            # Convert generator to list cuz we need to count stuff
+            return list(segments), info
+            
+        except Exception as e:
+            print(f"Transcription went wrong: {e}")
+            return None, None
+    
+    def segments_to_srt(self, segments, time_offset=0):
+        """Convert Whisper's output to SRT format with optional time offset
+        time_offset: seconds to add/subtract from timestamps (positive = delay, negative = earlier)
+        """
+        srt_content = []
+        
+        for i, segment in enumerate(segments, 1):
+            # Apply time offset (but don't go negative)
+            start_time = max(0, segment.start + time_offset)
+            end_time = max(0, segment.end + time_offset)
+            
+            # Format timestamps
+            start_formatted = self.format_timestamp(start_time)
+            end_formatted = self.format_timestamp(end_time)
+            text = segment.text.strip()
+            
+            srt_content.append(f"{i}")
+            srt_content.append(f"{start_formatted} --> {end_formatted}")
+            srt_content.append(text)
+            srt_content.append("")  # Empty line cuz SRT format is picky
+        
+        return "\n".join(srt_content)
+    
+    @staticmethod
+    def format_timestamp(seconds):
+        """Format seconds to SRT timestamp (HH:MM:SS,mmm) - yes, with a comma not a dot"""
+        td = timedelta(seconds=seconds)
+        hours = int(td.total_seconds() // 3600)
+        minutes = int((td.total_seconds() % 3600) // 60)
+        seconds = td.total_seconds() % 60
+        
+        return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}".replace(".", ",")
+
+
+class WhisperSubtitleApp:
+    """The GUI that makes this whole thing not look like a terminal hack"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Whisper Subtitle Converter - Recursive Folder Edition")
+        self.root.geometry("900x700")
+        
+        # State variables (keeping track of what we're doing)
+        self.processing = False
+        self.cancel_requested = False
+        self.process_thread = None
+        self.selected_folder = None
+        self.delete_temp_audio = tk.BooleanVar(value=True)
+        self.recursive_search = tk.BooleanVar(value=True)  # New: search in subfolders
+        self.translate_to_english = tk.BooleanVar(value=False)  # New: translate to English
+        self.time_offset = tk.DoubleVar(value=0.0)  # New: time offset for subtitles
+        
+        # Performance tracking for time estimates
+        self.processing_speeds = []  # Track processing speed for estimates
+        self.current_file_start = None
+        self.total_duration_processed = 0
+        self.total_time_taken = 0
+        
+        # Load saved config like a boss
+        self.load_config()
+        
+        # Build the GUI
+        self.setup_gui()
+        
+        # Check dependencies on startup (installs stuff if needed)
+        if not DependencyChecker.check_and_install_dependencies():
+            self.root.after(1000, self.root.quit)
+    
+    def load_config(self):
+        """Load saved settings from last time"""
+        if CONFIG_PATH.exists():
+            try:
+                with open(CONFIG_PATH, 'r') as f:
+                    config = json.load(f)
+                    self.last_folder = config.get('last_folder', '')
+            except:
+                self.last_folder = ''
+        else:
+            self.last_folder = ''
+    
+    def save_config(self):
+        """Save settings for next time"""
+        config = {'last_folder': self.selected_folder or ''}
+        try:
+            with open(CONFIG_PATH, 'w') as f:
+                json.dump(config, f)
+        except:
+            pass  # Whatever, not critical
+    
+    def find_all_videos(self, folder_path):
+        """Recursively find all video files in folder and subfolders"""
+        video_extensions = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v')
+        video_files = []
+        
+        folder_path = Path(folder_path)
+        
+        if self.recursive_search.get():
+            # Recursive search - dig through all them folders
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith(video_extensions):
+                        video_files.append(Path(root) / file)
+        else:
+            # Just this folder, no recursion
+            video_files = [f for f in folder_path.iterdir() 
+                          if f.is_file() and f.suffix.lower() in video_extensions]
+        
+        # Sort em so we process in order
+        video_files.sort()
+        return video_files
+    
+    def estimate_completion_time(self, duration_seconds):
+        """Estimate how long this file will take based on past performance"""
+        if not self.processing_speeds:
+            # No data yet, use conservative estimates
+            if self.model_var.get() == "tiny":
+                speed_factor = 2.0  # Assume 2x real-time initially
+            else:  # small
+                speed_factor = 0.5  # Assume 0.5x real-time initially
+        else:
+            # Use average of last few files
+            avg_speed = sum(self.processing_speeds[-5:]) / len(self.processing_speeds[-5:])
+            speed_factor = avg_speed
+        
+        estimated_seconds = duration_seconds / speed_factor
+        return estimated_seconds
+    
+    def format_time_remaining(self, seconds):
+        """Format seconds into human readable time"""
+        if seconds < 60:
+            return f"{int(seconds)} seconds"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+    
+    def setup_gui(self):
+        """Build the GUI (make it look pretty)"""
+        # Main container
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights for resizing
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(5, weight=1)
+        
+        # Folder selection
+        ttk.Label(main_frame, text="Main Folder:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.folder_var = tk.StringVar(value=self.last_folder)
+        folder_entry = ttk.Entry(main_frame, textvariable=self.folder_var, state='readonly')
+        folder_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        ttk.Button(main_frame, text="Browse", command=self.select_folder).grid(row=0, column=2, pady=5, padx=5)
+        
+        # Video count label
+        self.video_count_label = ttk.Label(main_frame, text="No folder selected", foreground="gray")
+        self.video_count_label.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=2)
+        
+        # Model selection
+        ttk.Label(main_frame, text="Whisper Model:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.model_var = tk.StringVar(value="tiny")
+        model_combo = ttk.Combobox(main_frame, textvariable=self.model_var, state='readonly', width=20)
+        model_combo['values'] = ('tiny', 'small')
+        model_combo.grid(row=2, column=1, sticky=tk.W, pady=5, padx=(5, 0))
+        
+        # Options frame
+        options_frame = ttk.LabelFrame(main_frame, text="Options", padding="5")
+        options_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        
+        ttk.Checkbutton(
+            options_frame, 
+            text="Search in subfolders (recursive mode - finds videos in nested folders)",
+            variable=self.recursive_search,
+            command=self.update_video_count
+        ).pack(anchor=tk.W)
+        
+        ttk.Checkbutton(
+            options_frame, 
+            text="Translate to English (auto-detects language and converts to English subs)",
+            variable=self.translate_to_english
+        ).pack(anchor=tk.W)
+        
+        ttk.Checkbutton(
+            options_frame, 
+            text="Delete temp audio files after processing (saves space)",
+            variable=self.delete_temp_audio
+        ).pack(anchor=tk.W)
+        
+        # Time offset controls (new feature for sync adjustment)
+        offset_frame = ttk.Frame(options_frame)
+        offset_frame.pack(anchor=tk.W, pady=(10, 0))
+        
+        ttk.Label(offset_frame, text="Subtitle Delay/Offset:").pack(side=tk.LEFT)
+        
+        # Decrease buttons
+        ttk.Button(offset_frame, text="-2", width=3, 
+                  command=lambda: self.adjust_offset(-2)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(offset_frame, text="-1", width=3, 
+                  command=lambda: self.adjust_offset(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(offset_frame, text="-0.5", width=4, 
+                  command=lambda: self.adjust_offset(-0.5)).pack(side=tk.LEFT, padx=2)
+        
+        # Offset display
+        self.offset_label = ttk.Label(offset_frame, text="0.0s", font=('TkDefaultFont', 10, 'bold'))
+        self.offset_label.pack(side=tk.LEFT, padx=10)
+        
+        # Increase buttons
+        ttk.Button(offset_frame, text="+0.5", width=4, 
+                  command=lambda: self.adjust_offset(0.5)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(offset_frame, text="+1", width=3, 
+                  command=lambda: self.adjust_offset(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(offset_frame, text="+2", width=3, 
+                  command=lambda: self.adjust_offset(2)).pack(side=tk.LEFT, padx=2)
+        
+        # Reset button
+        ttk.Button(offset_frame, text="Reset", width=5, 
+                  command=lambda: self.set_offset(0)).pack(side=tk.LEFT, padx=10)
+        
+        # Offset explanation
+        offset_help = ttk.Label(options_frame, 
+                               text="š” Positive = delay subs (if they appear too early) | Negative = subs appear earlier (if they're late)",
+                               foreground="gray")
+        offset_help.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Control buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=4, column=0, columnspan=3, pady=10)
+        
+        self.run_button = ttk.Button(button_frame, text="Run", command=self.run_processing, state='disabled')
+        self.run_button.pack(side=tk.LEFT, padx=5)
+        
+        self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self.cancel_processing, state='disabled')
+        self.cancel_button.pack(side=tk.LEFT, padx=5)
+        
+        # Progress section
+        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="5")
+        progress_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        # Overall progress
+        ttk.Label(progress_frame, text="Overall:").grid(row=0, column=0, sticky=tk.W)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        progress_frame.columnconfigure(1, weight=1)
+        
+        # Current file progress
+        ttk.Label(progress_frame, text="Current:").grid(row=1, column=0, sticky=tk.W, pady=(5,0))
+        self.current_progress_var = tk.DoubleVar()
+        self.current_progress_bar = ttk.Progressbar(progress_frame, variable=self.current_progress_var, maximum=100)
+        self.current_progress_bar.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=(5,0))
+        
+        # Status and ETA
+        self.status_label = ttk.Label(main_frame, text="Ready to roll")
+        self.status_label.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=5)
+        
+        self.eta_label = ttk.Label(main_frame, text="", foreground="blue")
+        self.eta_label.grid(row=7, column=0, columnspan=3, sticky=tk.W)
+        
+        # Log area
+        log_frame = ttk.LabelFrame(main_frame, text="Log (what's happening rn)", padding="5")
+        log_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(8, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap=tk.WORD)
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Performance warning
+        warning_label = ttk.Label(
+            main_frame, 
+            text="ā ļø CPU transcription is slow af. Tiny model: ~1-3x realtime | Small model: ~0.3-1x realtime on potatoes",
+            foreground="orange"
+        )
+        warning_label.grid(row=9, column=0, columnspan=3, pady=5)
+    
+    def adjust_offset(self, delta):
+        """Adjust the subtitle time offset"""
+        current = self.time_offset.get()
+        new_value = current + delta
+        self.set_offset(new_value)
+    
+    def set_offset(self, value):
+        """Set the subtitle time offset"""
+        self.time_offset.set(value)
+        # Update display
+        if value == 0:
+            self.offset_label['text'] = "0.0s"
+            self.offset_label['foreground'] = "black"
+        elif value > 0:
+            self.offset_label['text'] = f"+{value:.1f}s"
+            self.offset_label['foreground'] = "blue"
+        else:
+            self.offset_label['text'] = f"{value:.1f}s"
+            self.offset_label['foreground'] = "red"
+    
+    def update_video_count(self):
+        """Update the video count when folder or recursive option changes"""
+        if self.selected_folder:
+            videos = self.find_all_videos(self.selected_folder)
+            count = len(videos)
+            
+            if count == 0:
+                self.video_count_label['text'] = "No videos found in selected folder"
+                self.video_count_label['foreground'] = "red"
+                self.run_button['state'] = 'disabled'
+            else:
+                mode = "recursively" if self.recursive_search.get() else "in folder"
+                self.video_count_label['text'] = f"Found {count} video{'s' if count != 1 else ''} {mode}"
+                self.video_count_label['foreground'] = "green"
+                self.run_button['state'] = 'normal'
+                
+                # Show folder structure if recursive
+                if self.recursive_search.get() and count > 0:
+                    folders = set(str(v.parent.relative_to(self.selected_folder)) 
+                                 for v in videos)
+                    if len(folders) > 1:
+                        self.log(f"Videos found in {len(folders)} different folders")
+    
+    def select_folder(self):
+        """Let user pick the main folder"""
+        folder = filedialog.askdirectory(initialdir=self.last_folder or os.path.expanduser("~"))
+        if folder:
+            self.selected_folder = folder
+            self.folder_var.set(folder)
+            self.save_config()
+            
+            self.log(f"Selected folder: {folder}")
+            self.update_video_count()
+    
+    def log(self, message):
+        """Add message to log (with timestamp cuz we're fancy)"""
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+    
+    def update_status(self, message):
+        """Update status label"""
+        self.status_label['text'] = message
+        self.root.update_idletasks()
+    
+    def run_processing(self):
+        """Start processing videos in a separate thread (don't freeze the GUI)"""
+        if self.processing:
+            return
+        
+        self.processing = True
+        self.cancel_requested = False
+        self.run_button['state'] = 'disabled'
+        self.cancel_button['state'] = 'normal'
+        
+        # Reset performance tracking
+        self.processing_speeds = []
+        self.total_duration_processed = 0
+        self.total_time_taken = 0
+        
+        # Start processing thread
+        self.process_thread = threading.Thread(target=self.process_videos)
+        self.process_thread.daemon = True
+        self.process_thread.start()
+    
+    def cancel_processing(self):
+        """User said stop, so we stop"""
+        self.cancel_requested = True
+        self.log("Cancellation requested... finishing current file...")
+        self.cancel_button['state'] = 'disabled'
+    
+    def process_videos(self):
+        """Process all videos (the main event)"""
+        try:
+            # Find all videos
+            video_files = self.find_all_videos(self.selected_folder)
+            
+            if not video_files:
+                self.log("No video files found! Check your folder?")
+                return
+            
+            # Initialize Whisper
+            self.log(f"Loading Whisper {self.model_var.get()} model... (first time downloads ~40-250MB)")
+            self.update_status("Loading model... grab a snack, this takes a sec")
+            
+            generator = SubtitleGenerator(
+                model_size=self.model_var.get(),
+                device="cpu",
+                compute_type="int8"  # Quantized for speed boost
+            )
+            
+            self.log("Model loaded! Let's gooooo š")
+            
+            # Process each video
+            total_files = len(video_files)
+            batch_start_time = time.time()
+            
+            for idx, video_path in enumerate(video_files, 1):
+                if self.cancel_requested:
+                    self.log("Processing cancelled by user")
+                    break
+                
+                # Update overall progress
+                overall_progress = ((idx - 1) / total_files) * 100
+                self.progress_var.set(overall_progress)
+                
+                # Get relative path for cleaner display
+                try:
+                    display_path = video_path.relative_to(self.selected_folder)
+                except:
+                    display_path = video_path.name
+                
+                self.log(f"\n[{idx}/{total_files}] Processing: {display_path}")
+                self.update_status(f"Processing {video_path.name}...")
+                
+                # Reset current file progress
+                self.current_progress_var.set(0)
+                self.current_file_start = time.time()
+                
+                # Create paths
+                srt_path = video_path.with_suffix('.srt')
+                temp_audio = Path(tempfile.gettempdir()) / f"whisper_temp_{video_path.stem}.wav"
+                
+                try:
+                    # Step 1: Extract audio (20% progress)
+                    self.log(f"  ā Extracting audio...")
+                    self.current_progress_var.set(20)
+                    
+                    if not generator.extract_audio(video_path, temp_audio):
+                        self.log(f"  ā Failed to extract audio from {video_path.name}")
+                        continue
+                    
+                    # Get duration for time estimates
+                    duration = generator.get_audio_duration(temp_audio)
+                    if duration:
+                        remaining_files = total_files - idx
+                        estimated_time = self.estimate_completion_time(duration)
+                        
+                        # Estimate for remaining files
+                        if self.processing_speeds:
+                            avg_speed = sum(self.processing_speeds[-5:]) / len(self.processing_speeds[-5:])
+                            # Rough estimate: assume average video is similar length
+                            total_remaining = estimated_time + (remaining_files * duration / avg_speed)
+                            self.eta_label['text'] = f"ETA for current: ~{self.format_time_remaining(estimated_time)} | Total remaining: ~{self.format_time_remaining(total_remaining)}"
+                        else:
+                            self.eta_label['text'] = f"ETA for current file: ~{self.format_time_remaining(estimated_time)}"
+                    
+                    # Step 2: Transcribe (20-90% progress)
+                    self.log(f"  ā Transcribing... (go touch grass, this takes time)")
+                    self.current_progress_var.set(30)
+                    
+                    # Check if we need to translate
+                    translate = self.translate_to_english.get()
+                    if translate:
+                        self.log(f"  ā Translation mode: ON (will convert to English)")
+                    
+                    start_time = time.time()
+                    segments, info = generator.transcribe_audio(temp_audio, translate_to_english=translate)
+                    transcribe_time = time.time() - start_time
+                    
+                    if segments is None:
+                        self.log(f"  ā Failed to transcribe {video_path.name}")
+                        continue
+                    
+                    self.current_progress_var.set(90)
+                    
+                    # Calculate and store processing speed
+                    if duration and transcribe_time > 0:
+                        speed = duration / transcribe_time  # Speed factor (e.g., 2.0 = 2x realtime)
+                        self.processing_speeds.append(speed)
+                        self.total_duration_processed += duration
+                        self.total_time_taken += transcribe_time
+                        self.log(f"  ā Transcribed at {speed:.2f}x realtime speed")
+                    
+                    if info and info.language:
+                        lang_msg = f"  ā Detected language: {info.language}"
+                        if translate and info.language != "en":
+                            lang_msg += " (translated to English)"
+                        self.log(lang_msg)
+                    
+                    # Step 3: Generate SRT with time offset
+                    time_offset = self.time_offset.get()
+                    if time_offset != 0:
+                        self.log(f"  ā Applying time offset: {time_offset:+.1f} seconds")
+                    
+                    srt_content = generator.segments_to_srt(segments, time_offset)
+                    
+                    # Step 4: Save SRT file
+                    with open(srt_path, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                    
+                    self.log(f"  ā Saved: {srt_path.name}")
+                    self.current_progress_var.set(100)
+                    
+                    # Clean up temp audio if requested
+                    if self.delete_temp_audio.get() and temp_audio.exists():
+                        temp_audio.unlink()
+                    
+                except Exception as e:
+                    self.log(f"  ā Error processing {video_path.name}: {str(e)}")
+                    
+                    # Clean up on error
+                    if temp_audio.exists():
+                        temp_audio.unlink()
+                
+                # Update final progress
+                overall_progress = (idx / total_files) * 100
+                self.progress_var.set(overall_progress)
+            
+            # Processing complete
+            total_time = time.time() - batch_start_time
+            
+            if not self.cancel_requested:
+                self.log(f"\nā All files processed! Total time: {self.format_time_remaining(total_time)}")
+                if self.processing_speeds:
+                    avg_speed = self.total_duration_processed / self.total_time_taken
+                    self.log(f"Average processing speed: {avg_speed:.2f}x realtime")
+                self.update_status("Done! You're a legend š")
+                messagebox.showinfo("Complete", f"Processed {total_files} videos in {self.format_time_remaining(total_time)}!")
+            else:
+                self.update_status("Cancelled")
+                self.eta_label['text'] = ""
+        
+        except Exception as e:
+            self.log(f"Fatal error (rip): {str(e)}")
+            messagebox.showerror("Error", f"Processing failed: {str(e)}")
+        
+        finally:
+            # Reset UI
+            self.processing = False
+            self.run_button['state'] = 'normal'
+            self.cancel_button['state'] = 'disabled'
+            self.progress_var.set(0)
+            self.current_progress_var.set(0)
+            self.eta_label['text'] = ""
+
+
+def main():
+    """Main entry point - where it all begins"""
+    # Check if running on Linux (cuz that's what we optimized for)
+    if sys.platform not in ['linux', 'linux2']:
+        print("Warning: This app is optimized for Linux (Pop!_OS) but YOLO")
+    
+    # Fire up the GUI
+    root = tk.Tk()
+    app = WhisperSubtitleApp(root)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\nPeace out...")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
